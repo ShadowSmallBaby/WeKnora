@@ -178,9 +178,85 @@ class WeKnoraClient:
         }
         return self._request("POST", "/knowledge-bases", json=data)
 
-    def list_knowledge_bases(self) -> Dict:
-        """List all knowledge bases"""
-        return self._request("GET", "/knowledge-bases")
+    def list_knowledge_bases(self, include_shared: bool = False) -> Dict:
+        """List knowledge bases (optionally including shared ones)
+
+        Args:
+            include_shared: If True, merges both owned and shared knowledge bases into one list.
+                          If False (default), returns only owned knowledge bases.
+
+        Returns:
+            When include_shared=False:
+                {"success": true, "data": {"items": [owned KBs]}}
+            When include_shared=True:
+                {
+                    "success": true,
+                    "data": {
+                        "items": [
+                            {"kb": {...}, "source": "owned"},
+                            {"kb": {...}, "source": "shared", "org_name": "...", "permission": "..."},
+                            ...
+                        ],
+                        "total": 10,
+                        "owned_count": 7,
+                        "shared_count": 3
+                    }
+                }
+        """
+        if not include_shared:
+            # Original behavior: only owned KBs
+            return self._request("GET", "/knowledge-bases")
+
+        # Merge owned and shared KBs
+        owned_response = self._request("GET", "/knowledge-bases")
+        shared_response = self._request("GET", "/shared-knowledge-bases")
+
+        # Extract items from owned KBs
+        owned_data = owned_response.get("data", owned_response) if isinstance(owned_response, dict) else owned_response
+        if isinstance(owned_data, dict):
+            owned_items = owned_data.get("items", owned_data.get("list", []))
+        else:
+            owned_items = owned_data if isinstance(owned_data, list) else []
+
+        # Extract items from shared KBs
+        shared_data = shared_response.get("data", shared_response) if isinstance(shared_response, dict) else shared_response
+        shared_items = shared_data if isinstance(shared_data, list) else []
+
+        # Merge results with source indicator
+        merged_items = []
+
+        # Add owned KBs
+        for kb in owned_items:
+            if isinstance(kb, dict):
+                merged_items.append({
+                    "kb": kb,
+                    "source": "owned"
+                })
+
+        # Add shared KBs
+        for share in shared_items:
+            if isinstance(share, dict):
+                kb = share.get("knowledge_base")
+                if kb:
+                    merged_items.append({
+                        "kb": kb,
+                        "source": "shared",
+                        "org_name": share.get("org_name", ""),
+                        "organization_id": share.get("organization_id", ""),
+                        "permission": share.get("permission", "viewer"),
+                        "source_tenant_id": share.get("source_tenant_id"),
+                        "shared_at": share.get("shared_at", "")
+                    })
+
+        return {
+            "success": True,
+            "data": {
+                "items": merged_items,
+                "total": len(merged_items),
+                "owned_count": len([i for i in merged_items if i.get("source") == "owned"]),
+                "shared_count": len([i for i in merged_items if i.get("source") == "shared"])
+            }
+        }
 
     def get_knowledge_base(self, kb_id: str) -> Dict:
         """Get knowledge base details"""
@@ -246,12 +322,31 @@ class WeKnoraClient:
             "Use list_knowledge_bases to see available IDs and names."
         )
 
-    def hybrid_search(self, kb_id: str, query: str, config: Dict) -> Dict:
-        """Perform hybrid search combining vector and keyword search"""
+    def list_shared_knowledge_bases(self) -> Dict:
+        """List all knowledge bases shared to the current tenant through organizations"""
+        return self._request("GET", "/shared-knowledge-bases")
+
+    def hybrid_search(self, kb_id: str, query: str, config: Dict, knowledge_base_ids: list = None) -> Dict:
+        """Perform hybrid search combining vector and keyword search
+
+        Args:
+            kb_id: Primary knowledge base ID (used for embedding model resolution)
+            query: Search query text
+            config: Search configuration (thresholds, match count, etc.)
+            knowledge_base_ids: Optional list of additional KB IDs to search across.
+                               When provided, search spans all specified KBs (including shared ones).
+                               All KBs must use the same embedding model.
+
+        Returns:
+            Search results from all specified knowledge bases
+        """
         data = {
             "query_text": query,
             **config,  # Include thresholds and match count
         }
+        # Add knowledge_base_ids for multi-KB search if provided
+        if knowledge_base_ids:
+            data["knowledge_base_ids"] = knowledge_base_ids
         return self._request(
             "POST", f"/knowledge-bases/{kb_id}/hybrid-search", json=data
         )
@@ -621,7 +716,21 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="list_knowledge_bases",
-            description="List all knowledge bases",
+            description="List all knowledge bases owned by the current tenant. Optionally include shared knowledge bases from other tenants by setting include_shared=true.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_shared": {
+                        "type": "boolean",
+                        "description": "If true, merges both owned and shared knowledge bases into one list with source indicators. If false (default), returns only owned knowledge bases.",
+                        "default": False
+                    }
+                }
+            },
+        ),
+        types.Tool(
+            name="list_shared_knowledge_bases",
+            description="List all knowledge bases shared to the current tenant through organizations. These are knowledge bases owned by other tenants but accessible via organization sharing.",
             inputSchema={"type": "object", "properties": {}},
         ),
         types.Tool(
@@ -648,15 +757,20 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="hybrid_search",
-            description="Perform hybrid search in knowledge base",
+            description="Perform hybrid search (vector + keyword) in one or multiple knowledge bases. Supports searching across both owned and shared knowledge bases. When searching multiple KBs, all must use the same embedding model.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "kb_id": {
                         "type": "string",
-                        "description": "Knowledge base UUID (e.g. 'a1b2c3d4-e5f6-7890-abcd-ef1234567890') OR name (e.g. 'my-knowledge-base'). Use list_knowledge_bases to discover available knowledge bases.",
+                        "description": "Primary knowledge base UUID (e.g. 'a1b2c3d4-e5f6-7890-abcd-ef1234567890') OR name (e.g. 'my-knowledge-base'). This KB's embedding model is used for the search. Use list_knowledge_bases or list_shared_knowledge_bases to discover available knowledge bases.",
                     },
                     "query": {"type": "string", "description": "Search query"},
+                    "knowledge_base_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: Additional knowledge base IDs/names to search across (including shared KBs). When provided, search spans all specified KBs. All KBs must use the same embedding model. Example: ['kb-uuid-1', 'shared-kb-uuid-2', 'my-kb-name']",
+                    },
                     "vector_threshold": {
                         "type": "number",
                         "description": "Vector similarity threshold",
@@ -1123,7 +1237,10 @@ async def handle_call_tool(
                 args["name"], args["description"], config
             )
         elif name == "list_knowledge_bases":
-            result = client.list_knowledge_bases()
+            include_shared = args.get("include_shared", False)
+            result = client.list_knowledge_bases(include_shared=include_shared)
+        elif name == "list_shared_knowledge_bases":
+            result = client.list_shared_knowledge_bases()
         elif name == "get_knowledge_base":
             result = client.get_knowledge_base(args["kb_id"])
         elif name == "delete_knowledge_base":
@@ -1141,8 +1258,23 @@ async def handle_call_tool(
                     "match_count", 5
                 ),  # Number of results to return
             }
+            # Resolve primary KB ID (name → UUID)
             kb_id = client.resolve_kb_id(args["kb_id"])
-            result = client.hybrid_search(kb_id, args["query"], config)
+
+            # Handle optional knowledge_base_ids for multi-KB search
+            knowledge_base_ids = None
+            if "knowledge_base_ids" in args and args["knowledge_base_ids"]:
+                # Resolve all KB IDs (names → UUIDs)
+                knowledge_base_ids = []
+                for kb_id_or_name in args["knowledge_base_ids"]:
+                    try:
+                        resolved_id = client.resolve_kb_id(kb_id_or_name)
+                        knowledge_base_ids.append(resolved_id)
+                    except ValueError as e:
+                        # If a KB can't be resolved, log and skip it
+                        logger.warning(f"Could not resolve KB '{kb_id_or_name}': {e}")
+
+            result = client.hybrid_search(kb_id, args["query"], config, knowledge_base_ids)
 
         # Knowledge Management
         elif name == "create_knowledge_from_file":
